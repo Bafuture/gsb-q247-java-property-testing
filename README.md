@@ -30,3 +30,80 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 247）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+# 实现说明：属性测试框架（`com.example.pbt`）
+
+纯 JDK 实现，无 jqwik / QuickTheories 等第三方属性测试依赖（仅测试作用域的 JUnit 5、AssertJ）。
+
+## 快速开始
+
+```java
+PropertyCheck.forAll(Arbitraries.integers().between(0, 100).build())
+    .check(i -> i < 50)                 // 谓词返回 false 即反例
+    .withTries(200)                     // 重复执行次数
+    .withSeed(42L)                      // 固定种子，完全可复现
+    .classify("small", i -> i < 10)     // 分类统计
+    .run()
+    .assertSuccessful();                // 失败时打印收缩后的反例
+```
+
+也支持断言风格（AssertJ 抛出的 `AssertionError` 视为反例）：
+
+```java
+PropertyCheck.forAll(Arbitraries.strings().between('a', 'z').build())
+    .checkAssert(s -> assertThat(s.length()).isLessThan(3));
+```
+
+## 生成器
+
+| 生成器 | 范围配置 | 边界值注入 |
+|--------|----------|-----------|
+| `integers().between(min,max)` | 闭区间 | 端点、0、±1、端点±1（约 15% 概率） |
+| `strings().between(c1,c2).ofMinLength/ofMaxLength/ofLength` | 字符区间与长度区间 | 空串、最短/最长串、边界字符 |
+| `lists(arbitrary).between(min,max).ofMinSize/ofMaxSize/ofSize` | 元素生成器 + 尺寸区间 | 空列表、最小/最大尺寸 |
+| `combine(a,b).as(...)` / `combine3(...)` | 组合生成器 | 各分量可独立收缩 |
+| `constant(v)` / `oneOf(...)` | 常量 / 等概率选择 | — |
+| `arbitrary.map/fmap/filter` | 派生生成器 | filter 连续丢弃 1 万次快速失败 |
+
+## 随机种子
+
+- `RandomSource` 使用自实现的 SplitMix64，不依赖 JDK 的 `Random` 实现细节；
+- `withSeed(long)` 后，输入序列、失败样本、收缩过程、分类分布逐位可复现；
+- 未指定种子时使用随机种子，结果中会报告实际种子（`statistics().seed()`），便于事后重放。
+
+## 收缩算法与保证
+
+生成器产出的是惰性“收缩树” `Shrinkable<T>`：每个值携带一串严格更小的候选项。
+
+- **整数**：朝零收缩，步长序列 1, 2, 4, 8, …（截断在区间内），候选最小者优先；
+- **字符串**：先缩短长度（每次砍掉多余长度的一半，再砍到最短长度），再逐字符向最小字符简化（步长 1, 2, 4, …）；
+- **列表**：先按“从大到小的连续块、每个位置”删除元素，再对每个元素原地收缩；
+- **组合值**：先收缩第一分量，再第二、第三分量。
+
+引擎（`Shrinker`）做**贪心下降**：反复在候选中取第一个仍然违反属性的子值，直到没有任何直接子值仍违反为止，并用 `withMaxShrinks` 限定步数。
+
+保证：
+
+1. **终止性**：每个生成器的子值在一个有界序上严格更小（离零更近、更短、元素更少），不可能成环；
+2. **可靠性**：每一步都重新执行属性，返回值必然仍是反例；
+3. **1-最小性**：结果不存在任何“一步可达”的更小反例；对单调整数谓词（如 `i < k`），因候选始终包含 `value±1`，1-最小即全局最小（测试中 `i < 50` 必收缩到 `50`，列表/字符串属性分别收缩到 `[0,0,0]` 和 `"aaa"`）；
+4. 非全局最小也是可接受的语义：框架只承诺 1-最小，不承诺任意复杂谓词下的全局最小。
+
+## 失败收集与统计
+
+- 一次运行中所有失败都会继续跑完，反例先收缩再按值 `equals` **去重**，保留首次出现顺序；
+- `PropertyResult.counterexamples()` 同时保留原始样本、收缩结果与各反例的收缩步数；
+- `PropertyStatistics` 提供：`tries`（执行次数）、`failures`（失败次数）、`shrinkSteps`（收缩总步数）、
+  `classification`（`classify(label, predicate)` 的标签计数，以及 `collect(label, fn)` 的派生桶计数）。
+
+## 测试覆盖
+
+`src/test/java/com/example/pbt` 下 5 个测试类：
+
+- `PassingPropertyTest`：属性通过（列表反转、断言风格、组合/过滤生成器）；
+- `ShrinkingTest`：整数/字符串/列表失败后收缩到最小反例，保留原始样本；
+- `SeedReproducibilityTest`：同种子的随机序列、完整运行结果（含收缩）与分类分布一致；
+- `ClassificationTest`：`classify` 穷举分类、`collect` 派生桶、非穷举分类计数；
+- `FailureCollectionTest`：多个不同反例全部保留、重复反例去重、失败不中断运行。
