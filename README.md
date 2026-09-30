@@ -16,8 +16,93 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 247）。
 ## 运行方式
 
 ```bash
-./mvnw -q verify
+mvn -q verify        # 或 ./mvnw -q verify
 ```
+
+## 实现：从零手写的属性测试框架
+
+框架位于 `src/main/java/com/example/gsb/pt/`，不依赖 jqwik、QuickTheories 等任何属性测试库，
+仅用 JDK 实现；测试使用 JUnit 5 + AssertJ。
+
+### 快速上手
+
+```java
+CheckConfig<Integer> config = CheckConfig
+        .<Integer>of(200, 42L)                       // 执行 200 次，固定随机种子
+        .withClassifier(x -> x < 50 ? "small" : "large"); // 分类统计（可选）
+
+PropertyResult<Integer> result = PropertyChecker.check(
+        Gen.ints(0, 1000),                           // 生成器
+        Property.of(x -> x < 10),                    // 属性（断言式 API 也可：抛异常即失败）
+        config);
+
+result.assertPassed();
+System.out.println(result.report());
+```
+
+### 组件一览
+
+| 类 | 职责 |
+|----|------|
+| `Gen<T>` | 生成器：`ints(min,max)`、`longs`、`booleans`、`strings(最小长度,最大长度,最小字符,最大字符)`、`lists(元素生成器,最小,最大)`、`sets(...)`，以及组合器 `map` / `flatMap` / `combine` / `oneOf` / `oneOfValues` / `constant` |
+| `Shrinkable<T>` | 生成值的**收缩树**：`value()` 加惰性的 `shrinks()` 候选流 |
+| `Property<T>` | 属性：`verify(value)` 正常返回即通过，抛异常即失败；`Property.of(Predicate)` 适配布尔断言 |
+| `CheckConfig` | 次数、种子、分类函数（`withClassifier`） |
+| `PropertyResult` | 结果统计：`tries()`、`failures()`、`shrinkSteps()`、`categories()`、`counterexamples()`、`report()` |
+| `PropertyChecker` | 引擎：生成 → 分类 → 执行 → 失败则收缩 → 收集去重 |
+
+边界值：数值/字符串/列表生成器以 10% 概率抽取配置区间的边界值（`min`、`max`、区间内的 `0`、
+`min+1`、`max-1`、最小/最大长度），其余 90% 均匀取值，因此每次运行都会覆盖边界且完全由种子决定。
+
+### 随机种子与可复现性
+
+所有随机性都来自 `new Random(seed)` 包装的 `RandomSource`：生成器不自行取随机数，
+`flatMap` 的内层生成器也使用在生成时捕获的固定子种子。因此相同种子 + 相同配置产生
+**完全相同**的输入序列、收缩路径、反例集合与分类统计（测试 `sameSeedReproducesTheEntireRun` 覆盖）。
+不显式给种子时使用随机种子，并记录在 `PropertyResult.seed()` 中，便于事后复现。
+
+### 收缩算法与保证
+
+每个生成值都是一棵收缩树，子节点是“严格更小”的候选，候选本身还是收缩树：
+
+- 整数/长整数：朝目标 `0`（若 0 在区间内，否则朝最近的区间端点）做对半步进，
+  候选按从激进到保守排列，如 `100 → 0, 50, 75, 88, 94, 97, 99`，每层只有 O(log|x|) 个候选；
+- 字符串：先按长度朝最小长度收缩（前缀截断 + 逐个删字符），再把每个字符朝最小字符收缩；
+- 列表：先按尺寸朝最小尺寸收缩（前缀截断 + 逐个删元素），再固定其他元素逐个收缩元素；
+- 组合：`map` 透传收缩树；`combine` 交替收缩左右两侧；`flatMap` 先收缩内层再用同种子重新派生外层。
+
+引擎采用**贪心下降（greedy descent）**：在当前反例处，按顺序检查直接子候选，移动到第一个
+仍然失败的候选，重复直到没有任何直接子候选失败。
+
+保证：
+1. **必然终止**：每次移动都沿“尺寸/长度/绝对值”等良基序严格下降（数值绝对差减半、
+   集合尺寸减小、元素按字典序减小），不存在无限下降链。
+2. **局部最小（1-最小）**：最终反例的所有直接收缩候选都使属性通过，即无法再单步缩小；
+   对单调失败域（如 `x < 10` 失败于 `x >= 10`）可收敛到全局最小反例，测试中断言精确收缩到
+   `10`、`"aaa"`、`[0, 0, 0]`。
+3. **确定性**：候选顺序固定，相同种子下收缩路径与结果完全一致。
+4. **不保证全局最小**：对存在多个孤立失败区间的属性，贪心下降可能停在不同的局部最小值
+   （这正是失败收集要保留多个反例的原因，见下）。
+
+### 分类统计与失败收集
+
+- 分类：每个生成值（收缩前）都经过分类函数计数，`result.categories()` 返回各类别执行次数，
+  无分类函数时归入 `uncategorized`；各类别次数之和恒等于执行次数，可直接判断覆盖是否偏斜。
+- 失败收集：一次运行不因首个失败停止，而是跑完全部 `tries`；每个失败输入先收缩到局部最小，
+  再按 `equals` 去重后保存在 `counterexamples()` 中（按首次发现排序），同时统计原始失败次数与
+  总收缩步数。测试 `multipleCounterexamplesAreCollectedAndDeduplicated` 用两个孤立失败区间
+  （`[10,19]` 与 `[80,89]`）验证一次运行收集到 `10` 和 `80` 两个去重后的反例，
+  且原始失败次数远多于 2。
+
+### 测试覆盖（`src/test/java/com/example/gsb/pt/`）
+
+- 属性通过（加法交换律，100 次无失败）；
+- 属性失败并收缩到最小反例（整数 `10`、字符串 `"aaa"`、列表 `[0,0,0]`）；
+- 种子可复现（生成器序列级与整次运行级）；
+- 分类统计（类别计数总和、双类别均非空、无分类器时归入 `uncategorized`）；
+- 失败收集与去重（多个局部最小反例全部保留）；
+- 统计项（执行次数、失败次数、收缩步数、类别分布、可读报告）；
+- 生成器范围与边界（整数、字符串、列表、集合、`map`/`combine`/`oneOf`/`constant`/`flatMap`）。
 
 ## 任务提示词
 
